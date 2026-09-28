@@ -27,8 +27,9 @@ type Server struct {
 	server      *httptest.Server
 	mu          sync.RWMutex
 	calls       []CallRecord
-	URL         string
-	DefaultTTFT time.Duration
+	URL              string
+	DefaultTTFT      time.Duration
+	DisableRecording bool
 }
 
 // NewServer initializes and starts a new mock provider server.
@@ -87,7 +88,9 @@ func (s *Server) recordCall(r *http.Request, body []byte) {
 
 func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
-	s.recordCall(r, body)
+	if !s.DisableRecording {
+		s.recordCall(r, body)
+	}
 
 	// Fault Injection: Delay
 	if delayHeader := r.Header.Get("X-Mock-Delay-Ms"); delayHeader != "" {

@@ -43,6 +43,7 @@ type Key struct {
 	LimitTPM         int
 	CurrentRPM       atomic.Int64
 	CurrentTPM       atomic.Int64
+	Headers          map[string]string
 	State            KeyState
 	ConsecutiveFails atomic.Int32
 	CooldownUntil    atomic.Int64 // Unix nanoseconds
@@ -57,6 +58,7 @@ func (k *Key) ToCredential() *provider.Credential {
 		ProviderName: k.Provider,
 		APIKey:       k.APIKey,
 		BaseURL:      k.BaseURL,
+		Headers:      k.Headers,
 	}
 }
 

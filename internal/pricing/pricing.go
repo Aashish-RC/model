@@ -3,7 +3,6 @@ package pricing
 import (
 	"math"
 	"strings"
-	"sync"
 	"sync/atomic"
 )
 
@@ -20,7 +19,6 @@ type ModelPricing struct {
 
 // Registry manages thread-safe model pricing lookups.
 type Registry struct {
-	mu     sync.RWMutex
 	models atomic.Pointer[map[string]ModelPricing]
 }
 

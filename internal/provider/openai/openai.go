@@ -31,8 +31,8 @@ func NewAdapter(client *http.Client) *Adapter {
 		client = &http.Client{
 			Timeout: 60 * time.Second,
 			Transport: &http.Transport{
-				MaxIdleConns:        1000,
-				MaxIdleConnsPerHost: 100,
+				MaxIdleConns:        10000,
+				MaxIdleConnsPerHost: 2000,
 				IdleConnTimeout:     90 * time.Second,
 			},
 		}

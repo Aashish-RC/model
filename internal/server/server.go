@@ -251,6 +251,14 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 
 		cred := key.ToCredential()
+		if cred.Headers == nil {
+			cred.Headers = make(map[string]string)
+		}
+		for k, vals := range r.Header {
+			if strings.HasPrefix(strings.ToLower(k), "x-mock-") && len(vals) > 0 {
+				cred.Headers[k] = vals[0]
+			}
+		}
 
 		if chatReq.Stream {
 			it, sErr := adapter.ExecuteStream(r.Context(), &chatReq, cred)

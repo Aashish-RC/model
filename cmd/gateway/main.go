@@ -25,21 +25,30 @@ func main() {
 	srv := server.NewServer(server.Config{})
 
 	// Provision default test virtual key if none exists
-	rawKey, keyHash, prefix, _ := store.GenerateRawKey("default")
+	rawKey := os.Getenv("GATEWAY_API_KEY")
+	if rawKey == "" {
+		rawKey = "sk-gw-default-key-1234567890abcdef"
+	}
+	keyHash := store.HashKey(rawKey)
+
 	_ = srv.KeyStore.SaveKey(&store.VirtualKey{
 		ID:        "vk-admin-default",
 		KeyHash:   keyHash,
-		KeyPrefix: prefix,
+		KeyPrefix: "default",
 		Name:      "Admin Default Key",
 		OrgID:     "org-default",
 		IsActive:  true,
 	})
-	srv.Wallet.SetBalance("org-default", 1000000000) // $1,000 balance
+	srv.Wallet.SetBalance("org-default", 1000000000000) // $1,000,000 balance
 
 	// If OPENAI_API_KEY is not provided in environment, default to mock provider
 	openaiKey := os.Getenv("OPENAI_API_KEY")
 	if openaiKey == "" {
 		mock := mockprovider.NewServer()
+		if os.Getenv("BENCHMARK_MODE") == "1" {
+			mock.DisableRecording = true
+			mock.DefaultTTFT = 0
+		}
 		log.Printf("No OPENAI_API_KEY provided; started local mock provider at %s", mock.URL)
 		srv.KeyPool.AddKey(&keypool.Key{
 			ID:       "mock-openai-key",
@@ -47,7 +56,7 @@ func main() {
 			APIKey:   "sk-mock-key",
 			BaseURL:  mock.URL + "/v1",
 			PoolType: keypool.PoolShared,
-			LimitRPM: 10000,
+			LimitRPM: 0, // unlimited for mock/benchmark
 		})
 	} else {
 		srv.KeyPool.AddKey(&keypool.Key{
