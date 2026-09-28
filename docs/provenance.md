@@ -110,3 +110,22 @@ This document records the exact reference repository paths and commit hashes con
 
 ### 20. Runtime Configuration Changes
 - `clones/litellm/litellm/proxy/proxy_server.py` (`6f5ad78a1f019a340ec5d2e6f6d72ff1bf32e6c2`)
+
+## Wave 3 Provenance Logs
+
+### 21. Guardrail Framework & Layered Detection
+- `clones/bifrost/core/schemas/guardrailmetadata.go` (`51172dbe37df018384d0f15f94940e01c40a7fff`)
+- `clones/bifrost/core/schemas/redaction.go` (`51172dbe37df018384d0f15f94940e01c40a7fff`)
+
+### 22. Policy Engine
+- `clones/bifrost/core/schemas/grant.go` (`51172dbe37df018384d0f15f94940e01c40a7fff`)
+
+### 23. Roles, SSO & SCIM Directory Synchronization
+- Clean-room specification according to RFC 7643 and RFC 7644 (SCIM 2.0 Core Schema and Protocol).
+
+### 24. Cryptographic Hash-Chained Audit Log
+- Clean-room specification of append-only tamper-evident SHA-256 hash-chained block ledger.
+
+### 25. Secrets & KMS Integration
+- `clones/bifrost/core/schemas/vault.go` (`51172dbe37df018384d0f15f94940e01c40a7fff`)
+- `clones/litellm/litellm/secret_managers/base_secret_manager.py` (`6f5ad78a1f019a340ec5d2e6f6d72ff1bf32e6c2`)
