@@ -22,7 +22,10 @@ func main() {
 		port = "8080"
 	}
 
-	srv := server.NewServer(server.Config{})
+	scimToken := os.Getenv("GATEWAY_SCIM_TOKEN")
+	srv := server.NewServer(server.Config{
+		SCIMToken: scimToken,
+	})
 
 	// Provision default test virtual key if none exists
 	rawKey := os.Getenv("GATEWAY_API_KEY")
