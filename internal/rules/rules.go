@@ -7,8 +7,6 @@ import (
 	"sync"
 
 	"cel.dev/cel-go/cel"
-	"cel.dev/cel-go/common/types"
-	"cel.dev/cel-go/common/types/ref"
 )
 
 // Actions defines what modifications are applied when a rule matches.
@@ -162,12 +160,7 @@ func (e *Engine) Evaluate(ctx context.Context, evalCtx *EvaluationContext) (*Res
 			continue
 		}
 
-		matched, ok := out.Value().(bool)
-		if !ok && out.Type() == types.BoolType {
-			if b, ok := out.(ref.Val); ok {
-				matched = b.Value().(bool)
-			}
-		}
+		matched, _ := out.Value().(bool)
 
 		if matched {
 			res.MatchedRules = append(res.MatchedRules, cr.Rule.ID)
