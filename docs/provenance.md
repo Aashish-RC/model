@@ -77,3 +77,36 @@ This document records the exact reference repository paths and commit hashes con
 - `clones/bifrost/core/overhead_e2e_test.go` (`51172dbe37df018384d0f15f94940e01c40a7fff`)
 - `clones/bifrost/core/abandonedstream_test.go` (`51172dbe37df018384d0f15f94940e01c40a7fff`)
 - `clones/litellm/litellm/integrations/mock_client_factory.py` (`6f5ad78a1f019a340ec5d2e6f6d72ff1bf32e6c2`)
+
+## Wave 2 Provenance Logs
+
+### 14. Routing Strategies (Latency, Cost, Least-Busy, TPM/RPM-Aware)
+- `clones/litellm/litellm/router_strategy/lowest_latency.py` (`6f5ad78a1f019a340ec5d2e6f6d72ff1bf32e6c2`)
+- `clones/litellm/litellm/router_strategy/lowest_cost.py` (`6f5ad78a1f019a340ec5d2e6f6d72ff1bf32e6c2`)
+- `clones/litellm/litellm/router_strategy/least_busy.py` (`6f5ad78a1f019a340ec5d2e6f6d72ff1bf32e6c2`)
+- `clones/litellm/litellm/router_strategy/lowest_tpm_rpm_v2.py` (`6f5ad78a1f019a340ec5d2e6f6d72ff1bf32e6c2`)
+- `clones/bifrost/core/keyselectors/weightedrandom.go` (`51172dbe37df018384d0f15f94940e01c40a7fff`)
+
+### 15. Adaptive Routing
+- `clones/litellm/litellm/router_strategy/base_routing_strategy.py` (`6f5ad78a1f019a340ec5d2e6f6d72ff1bf32e6c2`)
+- `clones/bifrost/core/decisionemulation.go` (`51172dbe37df018384d0f15f94940e01c40a7fff`)
+
+### 16. CEL Rules Engine
+- Clean-room specification based on Google Common Expression Language (CEL-Go) standard specification without reference repo derivation.
+
+### 17. Session Affinity
+- `clones/bifrost/core/sessionaffinity.go` (`51172dbe37df018384d0f15f94940e01c40a7fff`)
+- `clones/litellm/litellm/caching/affinity_cache.py` (`6f5ad78a1f019a340ec5d2e6f6d72ff1bf32e6c2`)
+
+### 18. Health Probing & Circuit Breaking
+- `clones/litellm/litellm/router.py` (`6f5ad78a1f019a340ec5d2e6f6d72ff1bf32e6c2`)
+- `clones/bifrost/core/failureclass.go` (`51172dbe37df018384d0f15f94940e01c40a7fff`)
+
+### 19. Exact & Semantic Response Cache
+- `clones/litellm/litellm/caching/caching.py` (`6f5ad78a1f019a340ec5d2e6f6d72ff1bf32e6c2`)
+- `clones/litellm/litellm/caching/in_memory_cache.py` (`6f5ad78a1f019a340ec5d2e6f6d72ff1bf32e6c2`)
+- `clones/litellm/litellm/caching/_internal_lru_cache.py` (`6f5ad78a1f019a340ec5d2e6f6d72ff1bf32e6c2`)
+- `clones/bifrost/core/promptcache_test.go` (`51172dbe37df018384d0f15f94940e01c40a7fff`)
+
+### 20. Runtime Configuration Changes
+- `clones/litellm/litellm/proxy/proxy_server.py` (`6f5ad78a1f019a340ec5d2e6f6d72ff1bf32e6c2`)
