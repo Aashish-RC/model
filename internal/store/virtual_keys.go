@@ -138,3 +138,19 @@ func (s *MemoryKeyStore) RevokeKey(id string) error {
 	k.IsActive = false
 	return nil
 }
+
+// RevokeKeysByUserID deactivates all virtual keys belonging to a user ID.
+func (s *MemoryKeyStore) RevokeKeysByUserID(userID string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	count := 0
+	for _, k := range s.byID {
+		if k.UserID == userID && k.IsActive {
+			k.IsActive = false
+			count++
+		}
+	}
+	return count, nil
+}
+
