@@ -9,6 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ra1/model-gateway/internal/cache"
+	"github.com/ra1/model-gateway/internal/circuitbreaker"
+	"github.com/ra1/model-gateway/internal/config"
 	"github.com/ra1/model-gateway/internal/fallback"
 	"github.com/ra1/model-gateway/internal/keypool"
 	"github.com/ra1/model-gateway/internal/metrics"
@@ -19,7 +22,10 @@ import (
 	"github.com/ra1/model-gateway/internal/provider/generic"
 	"github.com/ra1/model-gateway/internal/provider/openai"
 	"github.com/ra1/model-gateway/internal/router"
+	"github.com/ra1/model-gateway/internal/routing"
+	"github.com/ra1/model-gateway/internal/rules"
 	"github.com/ra1/model-gateway/internal/schema"
+	"github.com/ra1/model-gateway/internal/session"
 	"github.com/ra1/model-gateway/internal/store"
 	"github.com/ra1/model-gateway/internal/stream"
 	"github.com/ra1/model-gateway/internal/wallet"
@@ -35,18 +41,29 @@ type Server struct {
 	Metrics         *metrics.Metrics
 	StreamHandler   *stream.Handler
 	Adapters        map[string]provider.Adapter
+	CircuitBreakers *circuitbreaker.Registry
+	Cache           *cache.Engine
+	SessionAffinity *session.Manager
+	Rules           *rules.Engine
+	ConfigManager   *config.Manager
+	Strategies      map[routing.StrategyType]routing.Strategy
 	mux             *http.ServeMux
 	DefaultProvider string
 }
 
 // Config provides initial server dependencies.
 type Config struct {
-	KeyStore *store.MemoryKeyStore
-	KeyPool  *keypool.Manager
-	Pricing  *pricing.Registry
-	Wallet   *wallet.Manager
-	Fallback *fallback.Policy
-	Metrics  *metrics.Metrics
+	KeyStore        *store.MemoryKeyStore
+	KeyPool         *keypool.Manager
+	Pricing         *pricing.Registry
+	Wallet          *wallet.Manager
+	Fallback        *fallback.Policy
+	Metrics         *metrics.Metrics
+	CircuitBreakers *circuitbreaker.Registry
+	Cache           *cache.Engine
+	SessionAffinity *session.Manager
+	Rules           *rules.Engine
+	ConfigManager   *config.Manager
 }
 
 // NewServer initializes a fully-wired gateway server.
@@ -69,17 +86,46 @@ func NewServer(cfg Config) *Server {
 	if cfg.Metrics == nil {
 		cfg.Metrics = metrics.NewMetrics()
 	}
+	if cfg.CircuitBreakers == nil {
+		cfg.CircuitBreakers = circuitbreaker.NewRegistry(circuitbreaker.DefaultConfig())
+	}
+	if cfg.Cache == nil {
+		cfg.Cache = cache.NewEngine(cache.DefaultConfig())
+	}
+	if cfg.SessionAffinity == nil {
+		cfg.SessionAffinity = session.NewManager(nil, 30*time.Minute)
+	}
+	if cfg.ConfigManager == nil {
+		cfg.ConfigManager, _ = config.NewManager(nil)
+	}
+	if cfg.Rules == nil {
+		cfg.Rules, _ = rules.NewEngine(nil)
+	}
+
+	strats := map[routing.StrategyType]routing.Strategy{
+		routing.StrategyLowestLatency: &routing.LowestLatencyStrategy{},
+		routing.StrategyLowestCost:    &routing.LowestCostStrategy{},
+		routing.StrategyLeastBusy:     &routing.LeastBusyStrategy{},
+		routing.StrategyHeadroom:      &routing.HeadroomStrategy{},
+		routing.StrategyAdaptive:      routing.NewAdaptiveStrategy(routing.DefaultWeights(), 0.05),
+	}
 
 	s := &Server{
-		KeyStore:      cfg.KeyStore,
-		KeyPool:       cfg.KeyPool,
-		Pricing:       cfg.Pricing,
-		Wallet:        cfg.Wallet,
-		Fallback:      cfg.Fallback,
-		Metrics:       cfg.Metrics,
-		StreamHandler: stream.NewHandler(),
-		Adapters:      make(map[string]provider.Adapter),
-		mux:           http.NewServeMux(),
+		KeyStore:        cfg.KeyStore,
+		KeyPool:         cfg.KeyPool,
+		Pricing:         cfg.Pricing,
+		Wallet:          cfg.Wallet,
+		Fallback:        cfg.Fallback,
+		Metrics:         cfg.Metrics,
+		StreamHandler:   stream.NewHandler(),
+		CircuitBreakers: cfg.CircuitBreakers,
+		Cache:           cfg.Cache,
+		SessionAffinity: cfg.SessionAffinity,
+		Rules:           cfg.Rules,
+		ConfigManager:   cfg.ConfigManager,
+		Strategies:      strats,
+		Adapters:        make(map[string]provider.Adapter),
+		mux:             http.NewServeMux(),
 	}
 
 	// Register default provider adapters
@@ -94,12 +140,38 @@ func NewServer(cfg Config) *Server {
 }
 
 func (s *Server) setupRoutes() {
+	s.mux.HandleFunc("/admin/v1/reload", s.handleAdminReload)
 	s.mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
 	s.mux.HandleFunc("/v1/models", s.handleModels)
 	s.mux.HandleFunc("/health", s.handleHealth)
 	s.mux.HandleFunc("/healthz", s.handleHealth)
 	s.mux.HandleFunc("/ready", s.handleReady)
 	s.mux.Handle("/metrics", s.Metrics.Handler())
+}
+
+func (s *Server) handleAdminReload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var newCfg config.RuntimeConfig
+	if err := json.NewDecoder(r.Body).Decode(&newCfg); err != nil {
+		s.writeJSONError(w, http.StatusBadRequest, "Invalid configuration JSON", "invalid_config", "bad_json")
+		return
+	}
+	if err := s.ConfigManager.Update(&newCfg); err != nil {
+		s.writeJSONError(w, http.StatusBadRequest, err.Error(), "invalid_config", "validation_failed")
+		return
+	}
+	if len(newCfg.CELRules) > 0 {
+		_ = s.Rules.UpdateRules(newCfg.CELRules)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":   "reloaded",
+		"revision": s.ConfigManager.Get().Revision,
+	})
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -200,6 +272,57 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		chatReq.ID = fmt.Sprintf("req-%d", time.Now().UnixNano())
 	}
 
+	// Cache Check (non-streaming requests with no bypass)
+	bypassCache := r.Header.Get("Cache-Control") == "no-cache" || r.Header.Get("X-Gateway-Cache-Bypass") == "true"
+	var exactCacheKey string
+	if !chatReq.Stream && !bypassCache {
+		exactCacheKey = cache.HashRequest(vKey.OrgID, &chatReq)
+		if cached, found := s.Cache.GetExact(exactCacheKey); found && cached != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set(cache.HeaderCache, cache.CacheHit)
+			w.Header().Set(cache.HeaderCacheType, cache.TypeExact)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(cached)
+			s.Metrics.RequestsTotal.WithLabelValues(chatReq.RequestedModel, "cache", "200").Inc()
+			s.Metrics.RequestDuration.WithLabelValues(chatReq.RequestedModel, "cache", "false").Observe(time.Since(start).Seconds())
+			return
+		}
+	}
+
+	// CEL Rules Evaluation
+	evalCtx := &rules.EvaluationContext{
+		Model:           chatReq.RequestedModel,
+		Stream:          chatReq.Stream,
+		EstimatedTokens: 10,
+		Headers:         make(map[string]string),
+		User:            chatReq.User,
+		KeyID:           vKey.ID,
+		OrgID:           vKey.OrgID,
+		TeamID:          vKey.TeamID,
+	}
+	for k, vals := range r.Header {
+		if len(vals) > 0 {
+			evalCtx.Headers[strings.ToLower(k)] = vals[0]
+		}
+	}
+	if ruleRes, rErr := s.Rules.Evaluate(r.Context(), evalCtx); rErr == nil && ruleRes != nil {
+		if ruleRes.RewrittenModel != "" {
+			chatReq.RequestedModel = ruleRes.RewrittenModel
+		}
+		for hk, hv := range ruleRes.InjectedHeaders {
+			w.Header().Set(hk, hv)
+		}
+	}
+
+	// Session Affinity Resolution
+	sessionID := r.Header.Get("X-Session-ID")
+	if sessionID == "" {
+		sessionID = r.Header.Get("X-Thread-ID")
+	}
+	if sessionID == "" {
+		sessionID = chatReq.User
+	}
+
 	// 2. Two-Phase Reservation
 	maxTokens := chatReq.GetEffectiveMaxTokens()
 	if maxTokens <= 0 {
@@ -235,6 +358,18 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		providerName, adapter := s.resolveAdapter(currentModel)
 		chatReq.EffectiveModel = currentModel
 
+		if !s.CircuitBreakers.Get(providerName).Allow() {
+			nextModel, fErr := s.Fallback.GetNextModel(chatReq.RequestedModel, visitedModels)
+			if fErr == nil {
+				s.Metrics.ModelFallbacksTotal.WithLabelValues(chatReq.RequestedModel, nextModel).Inc()
+				currentModel = nextModel
+				visitedModels[currentModel] = true
+				continue
+			}
+			lastErr = circuitbreaker.ErrCircuitOpen
+			break
+		}
+
 		// Select key from pool
 		key, err := s.KeyPool.SelectKey(providerName, vKey.OrgID, false)
 		if err != nil {
@@ -263,6 +398,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		if chatReq.Stream {
 			it, sErr := adapter.ExecuteStream(r.Context(), &chatReq, cred)
 			if sErr != nil {
+				s.CircuitBreakers.Get(providerName).RecordFailure()
+				if sessionID != "" {
+					_ = s.SessionAffinity.Unbind(r.Context(), vKey.OrgID, sessionID)
+				}
 				decision := router.ClassifyError(sErr)
 				if decision.RotateKey {
 					key.MarkFailure(s.KeyPool.BaseCooldown, s.KeyPool.MaxCooldown)
@@ -277,6 +416,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			accum := stream.NewAccumulator(inputEstTokens)
 			_ = s.StreamHandler.ForwardStream(r.Context(), w, it, accum)
 			key.MarkSuccess()
+			s.CircuitBreakers.Get(providerName).RecordSuccess()
+			if sessionID != "" {
+				_ = s.SessionAffinity.Bind(r.Context(), vKey.OrgID, sessionID, providerName, key.ID, currentModel, 30*time.Minute)
+			}
 
 			// Post-call Settlement
 			usage := accum.Finalize()
@@ -329,6 +472,13 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		if execErr == nil && chatResp != nil {
 			key.MarkSuccess()
+			s.CircuitBreakers.Get(providerName).RecordSuccess()
+			if sessionID != "" {
+				_ = s.SessionAffinity.Bind(r.Context(), vKey.OrgID, sessionID, providerName, key.ID, currentModel, 30*time.Minute)
+			}
+			if exactCacheKey != "" && !chatReq.Stream {
+				s.Cache.PutExact(exactCacheKey, chatResp, 1*time.Hour)
+			}
 			fallback.AnnotateDowngrade(chatResp, chatReq.RequestedModel, currentModel)
 
 			// Response Headers for downgrade transparency
@@ -351,6 +501,13 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			s.Metrics.RequestsTotal.WithLabelValues(currentModel, providerName, "200").Inc()
 			s.Metrics.RequestDuration.WithLabelValues(currentModel, providerName, "false").Observe(time.Since(start).Seconds())
 			return
+		}
+
+		if execErr != nil {
+			s.CircuitBreakers.Get(providerName).RecordFailure()
+			if sessionID != "" {
+				_ = s.SessionAffinity.Unbind(r.Context(), vKey.OrgID, sessionID)
+			}
 		}
 
 		// Try fallback if primary model failed and can downgrade

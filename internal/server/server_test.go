@@ -12,6 +12,7 @@ import (
 	"github.com/ra1/model-gateway/internal/keypool"
 	"github.com/ra1/model-gateway/internal/pricing"
 	"github.com/ra1/model-gateway/internal/provider/openai"
+	"github.com/ra1/model-gateway/internal/rules"
 	"github.com/ra1/model-gateway/internal/schema"
 	"github.com/ra1/model-gateway/internal/store"
 	"github.com/ra1/model-gateway/internal/wallet"
@@ -192,3 +193,171 @@ func TestServer_ChatCompletions_Fallback(t *testing.T) {
 		t.Errorf("expected X-Effective-Model claude-3-5-sonnet, got %s", rec.Header().Get("X-Effective-Model"))
 	}
 }
+
+func TestServer_ChatCompletions_ExactCacheHit(t *testing.T) {
+	mock := mockprovider.NewServer()
+	defer mock.Close()
+
+	srv, rawKey := setupTestServer(mock)
+
+	reqPayload := `{"model":"gpt-4o","messages":[{"role":"user","content":"Cache me"}]}`
+
+	// 1. First request: Miss
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(reqPayload))
+	req1.Header.Set("Authorization", "Bearer "+rawKey)
+	req1.Header.Set("Content-Type", "application/json")
+	rec1 := httptest.NewRecorder()
+	srv.ServeHTTP(rec1, req1)
+
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("first request failed: %d", rec1.Code)
+	}
+	if rec1.Header().Get("X-Gateway-Cache") == "HIT" {
+		t.Errorf("expected miss on first request")
+	}
+
+	// 2. Second request: Hit
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(reqPayload))
+	req2.Header.Set("Authorization", "Bearer "+rawKey)
+	req2.Header.Set("Content-Type", "application/json")
+	rec2 := httptest.NewRecorder()
+	srv.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("second request failed: %d", rec2.Code)
+	}
+	if rec2.Header().Get("X-Gateway-Cache") != "HIT" {
+		t.Errorf("expected X-Gateway-Cache: HIT on second request")
+	}
+	if rec2.Header().Get("X-Gateway-Cache-Type") != "exact" {
+		t.Errorf("expected X-Gateway-Cache-Type: exact")
+	}
+}
+
+func TestServer_ChatCompletions_CELRulesRewrite(t *testing.T) {
+	mock := mockprovider.NewServer()
+	defer mock.Close()
+
+	srv, rawKey := setupTestServer(mock)
+
+	// Add CEL rule: rewrite gpt-4o to claude-3-5-sonnet when header x-routed-test is present
+	_ = srv.Rules.UpdateRules([]*rules.Rule{
+		{
+			ID:        "test-rule",
+			Condition: `request.headers["x-routed-test"] == "yes"`,
+			Actions: rules.Actions{
+				SetModel: "claude-3-5-sonnet",
+				SetHeaders: map[string]string{
+					"X-Custom-CEL": "applied",
+				},
+				Priority: 10,
+				Terminal: true,
+			},
+		},
+	})
+
+	reqPayload := `{"model":"gpt-4o","messages":[{"role":"user","content":"CEL test"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(reqPayload))
+	req.Header.Set("Authorization", "Bearer "+rawKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Routed-Test", "yes")
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("request failed: %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("X-Effective-Model") != "claude-3-5-sonnet" {
+		t.Errorf("expected rewritten model claude-3-5-sonnet, got %s", rec.Header().Get("X-Effective-Model"))
+	}
+	if rec.Header().Get("X-Custom-CEL") != "applied" {
+		t.Errorf("expected X-Custom-CEL: applied header")
+	}
+}
+
+func TestServer_AdminReload(t *testing.T) {
+	mock := mockprovider.NewServer()
+	defer mock.Close()
+
+	srv, _ := setupTestServer(mock)
+
+	reloadPayload := `{
+		"default_routing_strategy": "least_busy",
+		"fallback_chains": {"gpt-4o": ["claude-3-5-sonnet"]}
+	}`
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/v1/reload", bytes.NewBufferString(reloadPayload))
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on /admin/v1/reload, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	snap := srv.ConfigManager.Get()
+	if snap.DefaultRoutingStrategy != "least_busy" {
+		t.Errorf("expected updated strategy least_busy, got %s", snap.DefaultRoutingStrategy)
+	}
+}
+
+func TestServer_CircuitBreaker_FastFailover(t *testing.T) {
+	mock := mockprovider.NewServer()
+	defer mock.Close()
+
+	srv, rawKey := setupTestServer(mock)
+	srv.Fallback.SetChain("gpt-4o", []string{"claude-3-5-sonnet"})
+
+	// Trip circuit breaker for openai
+	cb := srv.CircuitBreakers.Get("openai")
+	for i := 0; i < 6; i++ {
+		cb.RecordFailure()
+	}
+
+	reqPayload := `{"model":"gpt-4o","messages":[{"role":"user","content":"Fast failover test"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(reqPayload))
+	req.Header.Set("Authorization", "Bearer "+rawKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from fast failover, got %d", rec.Code)
+	}
+	if rec.Header().Get("X-Effective-Model") != "claude-3-5-sonnet" {
+		t.Errorf("expected fallback to claude-3-5-sonnet, got %s", rec.Header().Get("X-Effective-Model"))
+	}
+}
+
+func TestServer_SessionAffinity(t *testing.T) {
+	mock := mockprovider.NewServer()
+	defer mock.Close()
+
+	srv, rawKey := setupTestServer(mock)
+
+	reqPayload := `{"model":"gpt-4o","messages":[{"role":"user","content":"Affinity call"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(reqPayload))
+	req.Header.Set("Authorization", "Bearer "+rawKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Session-ID", "sess-test-thread-101")
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("request failed: %d", rec.Code)
+	}
+
+	// Verify session binding was created
+	b, found := srv.SessionAffinity.Resolve(req.Context(), "org-test", "sess-test-thread-101")
+	if !found || b == nil {
+		t.Fatalf("expected session affinity binding to be established")
+	}
+	if b.Model != "gpt-4o" {
+		t.Errorf("expected bound model gpt-4o, got %s", b.Model)
+	}
+}
+
