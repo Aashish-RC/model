@@ -9,12 +9,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ra1/model-gateway/internal/audit"
+	"github.com/ra1/model-gateway/internal/auth/scim"
 	"github.com/ra1/model-gateway/internal/cache"
 	"github.com/ra1/model-gateway/internal/circuitbreaker"
 	"github.com/ra1/model-gateway/internal/config"
 	"github.com/ra1/model-gateway/internal/fallback"
+	"github.com/ra1/model-gateway/internal/guardrails"
 	"github.com/ra1/model-gateway/internal/keypool"
+	"github.com/ra1/model-gateway/internal/kms"
 	"github.com/ra1/model-gateway/internal/metrics"
+	"github.com/ra1/model-gateway/internal/policy"
 	"github.com/ra1/model-gateway/internal/pricing"
 	"github.com/ra1/model-gateway/internal/provider"
 	"github.com/ra1/model-gateway/internal/provider/anthropic"
@@ -47,6 +52,11 @@ type Server struct {
 	Rules           *rules.Engine
 	ConfigManager   *config.Manager
 	Strategies      map[routing.StrategyType]routing.Strategy
+	Guardrails      *guardrails.Manager
+	PolicyEngine    *policy.Engine
+	AuditLog        *audit.Ledger
+	KMSVault        kms.Vault
+	SCIM            *scim.Service
 	mux             *http.ServeMux
 	DefaultProvider string
 }
@@ -64,6 +74,12 @@ type Config struct {
 	SessionAffinity *session.Manager
 	Rules           *rules.Engine
 	ConfigManager   *config.Manager
+	Guardrails      *guardrails.Manager
+	PolicyEngine    *policy.Engine
+	AuditLog        *audit.Ledger
+	KMSVault        kms.Vault
+	SCIM            *scim.Service
+	SCIMToken       string
 }
 
 // NewServer initializes a fully-wired gateway server.
@@ -101,6 +117,18 @@ func NewServer(cfg Config) *Server {
 	if cfg.Rules == nil {
 		cfg.Rules, _ = rules.NewEngine(nil)
 	}
+	if cfg.AuditLog == nil {
+		cfg.AuditLog = audit.NewLedger()
+	}
+	if cfg.PolicyEngine == nil {
+		cfg.PolicyEngine = policy.NewEngine()
+	}
+	if cfg.KMSVault == nil {
+		cfg.KMSVault, _ = kms.NewLocalVault([]byte("01234567890123456789012345678901"))
+	}
+	if cfg.SCIM == nil {
+		cfg.SCIM = scim.NewService(cfg.SCIMToken, cfg.KeyStore)
+	}
 
 	strats := map[routing.StrategyType]routing.Strategy{
 		routing.StrategyLowestLatency: &routing.LowestLatencyStrategy{},
@@ -124,6 +152,11 @@ func NewServer(cfg Config) *Server {
 		Rules:           cfg.Rules,
 		ConfigManager:   cfg.ConfigManager,
 		Strategies:      strats,
+		Guardrails:      cfg.Guardrails,
+		PolicyEngine:    cfg.PolicyEngine,
+		AuditLog:        cfg.AuditLog,
+		KMSVault:        cfg.KMSVault,
+		SCIM:            cfg.SCIM,
 		Adapters:        make(map[string]provider.Adapter),
 		mux:             http.NewServeMux(),
 	}
@@ -141,12 +174,49 @@ func NewServer(cfg Config) *Server {
 
 func (s *Server) setupRoutes() {
 	s.mux.HandleFunc("/admin/v1/reload", s.handleAdminReload)
+	s.mux.HandleFunc("/admin/v1/audit", s.handleAuditLog)
+	s.mux.HandleFunc("/admin/v1/audit/verify", s.handleAuditVerify)
+	s.mux.Handle("/scim/v2/", s.SCIM)
 	s.mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
 	s.mux.HandleFunc("/v1/models", s.handleModels)
 	s.mux.HandleFunc("/health", s.handleHealth)
 	s.mux.HandleFunc("/healthz", s.handleHealth)
 	s.mux.HandleFunc("/ready", s.handleReady)
 	s.mux.Handle("/metrics", s.Metrics.Handler())
+}
+
+func (s *Server) handleAuditLog(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	records := s.AuditLog.GetEntries(0, 0)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(records)
+}
+
+func (s *Server) handleAuditVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	valid, err := s.AuditLog.VerifyChain()
+	w.Header().Set("Content-Type", "application/json")
+	if !valid {
+		w.WriteHeader(http.StatusConflict)
+		errMsg := ""
+		if err != nil {
+			errMsg = err.Error()
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"valid": false,
+			"error": errMsg,
+		})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"valid": true,
+	})
 }
 
 func (s *Server) handleAdminReload(w http.ResponseWriter, r *http.Request) {
@@ -270,6 +340,59 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	chatReq.TeamID = vKey.TeamID
 	if chatReq.ID == "" {
 		chatReq.ID = fmt.Sprintf("req-%d", time.Now().UnixNano())
+	}
+
+	// Policy Engine Governance Check
+	if s.PolicyEngine != nil {
+		clientIP := r.RemoteAddr
+		headersMap := make(map[string]string)
+		for hk, hvs := range r.Header {
+			if len(hvs) > 0 {
+				headersMap[strings.ToLower(hk)] = hvs[0]
+			}
+		}
+		pReq := policy.RequestContext{
+			ClientIP:             clientIP,
+			Team:                 vKey.TeamID,
+			Org:                  vKey.OrgID,
+			KeyPrefix:            vKey.KeyPrefix,
+			Model:                chatReq.RequestedModel,
+			MaxTokens:            chatReq.GetEffectiveMaxTokens(),
+			EstimatedInputTokens: 10,
+			Headers:              headersMap,
+		}
+		if pErr := s.PolicyEngine.Evaluate(r.Context(), pReq); pErr != nil {
+			code := "policy_violation"
+			if pvErr, ok := pErr.(*policy.PolicyViolationError); ok {
+				code = string(pvErr.Code)
+			}
+			s.writeJSONError(w, http.StatusForbidden, pErr.Error(), "policy_violation", code)
+			if s.AuditLog != nil {
+				_, _ = s.AuditLog.Append(vKey.ID, vKey.OrgID, "policy.violation", chatReq.RequestedModel, map[string]string{
+					"error": pErr.Error(),
+					"code":  code,
+				})
+			}
+			return
+		}
+	}
+
+	// Guardrails Pre-Call Evaluation
+	if s.Guardrails != nil {
+		gRes, gErr := s.Guardrails.InspectInput(r.Context(), &chatReq)
+		if gErr != nil || (gRes != nil && gRes.Blocked) {
+			reason := "Content blocked by safety guardrail"
+			if gRes != nil && gRes.Reason != "" {
+				reason = gRes.Reason
+			}
+			s.writeJSONError(w, http.StatusBadRequest, reason, "guardrail_violation", "content_blocked")
+			if s.AuditLog != nil {
+				_, _ = s.AuditLog.Append(vKey.ID, vKey.OrgID, "guardrails.pre_call.blocked", chatReq.RequestedModel, map[string]string{
+					"reason": reason,
+				})
+			}
+			return
+		}
 	}
 
 	// Cache Check (non-streaming requests with no bypass)
@@ -433,6 +556,14 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			if accum.FirstTokenTime > 0 {
 				s.Metrics.UpstreamTTFT.WithLabelValues(currentModel, providerName).Observe(accum.FirstTokenTime.Seconds())
 			}
+
+			if s.AuditLog != nil {
+				_, _ = s.AuditLog.Append(vKey.ID, vKey.OrgID, "chat.completion.stream", currentModel, map[string]string{
+					"provider":      providerName,
+					"prompt_tokens": strconv.Itoa(usage.PromptTokens),
+					"compl_tokens":  strconv.Itoa(usage.CompletionTokens),
+				})
+			}
 			return
 		}
 
@@ -471,6 +602,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if execErr == nil && chatResp != nil {
+			// Post-Call Guardrail Evaluation
+			if s.Guardrails != nil {
+				_, _ = s.Guardrails.InspectOutput(r.Context(), chatResp)
+			}
+
 			key.MarkSuccess()
 			s.CircuitBreakers.Get(providerName).RecordSuccess()
 			if sessionID != "" {
@@ -500,6 +636,14 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			s.Metrics.TokensTotal.WithLabelValues(currentModel, providerName, "completion").Add(float64(chatResp.Usage.CompletionTokens))
 			s.Metrics.RequestsTotal.WithLabelValues(currentModel, providerName, "200").Inc()
 			s.Metrics.RequestDuration.WithLabelValues(currentModel, providerName, "false").Observe(time.Since(start).Seconds())
+
+			if s.AuditLog != nil {
+				_, _ = s.AuditLog.Append(vKey.ID, vKey.OrgID, "chat.completion", currentModel, map[string]string{
+					"provider":      providerName,
+					"prompt_tokens": strconv.Itoa(chatResp.Usage.PromptTokens),
+					"compl_tokens":  strconv.Itoa(chatResp.Usage.CompletionTokens),
+				})
+			}
 			return
 		}
 
@@ -533,4 +677,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	s.writeJSONError(w, status, errMsg, "gateway_error", "execution_failed")
 	s.Metrics.RequestsTotal.WithLabelValues(chatReq.RequestedModel, "unknown", strconv.Itoa(status)).Inc()
+
+	if s.AuditLog != nil {
+		_, _ = s.AuditLog.Append(vKey.ID, vKey.OrgID, "chat.completion.failed", chatReq.RequestedModel, map[string]string{
+			"error":  errMsg,
+			"status": strconv.Itoa(status),
+		})
+	}
 }
