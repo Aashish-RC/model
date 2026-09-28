@@ -1,6 +1,0 @@
-*.exe
-*.dll
-*.so
-*.dylib
-/gateway
-/bin/

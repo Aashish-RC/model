@@ -9,20 +9,8 @@
 clones/
 
 # ------------------------------------------------------------------------------
-# Codebase Exclusions (Tests, UI Dashboard, Cookbooks, CI & Infra)
+# Codebase Build Artifacts
 # ------------------------------------------------------------------------------
-codebase/tests/
-codebase/ui/
-codebase/cookbook/
-codebase/helm/
-codebase/terraform/
-codebase/.github/
-codebase/.circleci/
-codebase/.devcontainer/
-codebase/.githooks/
-codebase/vscode-extension/
-codebase/examples/
-codebase/docker/
 
 # ------------------------------------------------------------------------------
 # Operating System Files
